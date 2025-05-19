@@ -4,6 +4,8 @@ import imageio
 import json
 import random
 import time
+import numpy.core.multiarray
+from torch.serialization import add_safe_globals
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -124,12 +126,16 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
     # Render and reshape
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
+        # print('Render:', k) # added
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
     k_extract = ['rgb_map', 'disp_map', 'acc_map', 'uncert_map', 'alpha_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
+    
+    torch.cuda.empty_cache() # added
+    
     return ret_list + [ret_dict]
 
 
@@ -225,9 +231,11 @@ def create_nerf(args):
 
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
+        add_safe_globals([numpy.core.multiarray._reconstruct]) # added
         ckpt_path = ckpts[-1]
         print('Reloading from', ckpt_path)
-        ckpt = torch.load(ckpt_path)
+        # ckpt = torch.load(ckpt_path) 
+        ckpt = torch.load(ckpt_path, weights_only=False) # added
 
         start = ckpt['global_step']
         i_train = ckpt['i_train']
@@ -435,6 +443,7 @@ def choose_new_k(H, W, focal, batch_rays, k, **render_kwargs_train):
     N = H*W
     n = batch_rays.shape[1] // N
     for i in range(n):
+        print(f"Rendered view: {i+1}") # added
         with torch.no_grad():
             rgb, disp, acc, uncert, alpha, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays[:,i*N:i*N+N,:],  verbose=True, retraw=True,  **render_kwargs_train)
 
@@ -446,6 +455,9 @@ def choose_new_k(H, W, focal, batch_rays, k, **render_kwargs_train):
         post = (1. / (1. / uncert_pts + weight_pts * weight_pts / uncert_render)).sum([1,2])
         pres.append(pre)
         posts.append(post)
+        
+        del rgb, disp, acc, uncert, alpha, extras, uncert_render, uncert_pts, weight_pts # added
+        torch.cuda.empty_cache() # added
     
     pres = torch.cat(pres, 0)
     posts = torch.cat(posts, 0)
@@ -564,6 +576,7 @@ def config_parser():
     parser.add_argument("--init_image",   type=int, default=10) # initial number of images, only for llff dataset
     parser.add_argument("--choose_k",   type=int, default=4) # The number of new captured data for each active iter
     parser.add_argument("--beta_min",   type=float, default=0.01) # Minimun value for uncertainty
+    # parser.add_argument("--beta_min",   type=float, default=0.1) # Minimun value for uncertainty # added
     parser.add_argument("--w",   type=float, default=0.01) # Strength for regularization as in Eq.(11)
     parser.add_argument("--ds_rate",   type=int, default=2) # Quality-efficiency trade-off factor as in Sec. 5.2
 
@@ -718,24 +731,29 @@ def train():
     print('VAL views are', i_val)
     
     start = start + 1
+    active_time = None # added
+    active_step = 1 # added
     for i in trange(start, N_iters):
 
         # active evaluation
         if i in args.active_iter:
+            active_time = time.time() # added
+            
             print('start evaluation:')
             print('get rays')
             rays = np.stack([get_rays_np(H, W, focal, p) for p in poses.cpu().numpy()[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
             print('done, concats')
-
+            print(f'Memory Allocated: {torch.cuda.memory_allocated()/(1024 ** 3):.2f} GB') # added
+            
             # get all holdout rays (candidate)
             rays_rgb_all = torch.cat([torch.tensor(rays).to(device), images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
             rays_rgb_all = rays_rgb_all.permute(0,2,3,1,4) # [N, H, W, ro+rd+rgb, 3]
-
             rays_rgb_holdout = torch.cat([rays_rgb_all[j, ::args.ds_rate, ::args.ds_rate] for j in i_holdout], 0)
             rays_rgb_holdout = torch.reshape(rays_rgb_holdout, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
             rays_rgb_holdout = torch.transpose(rays_rgb_holdout, 0, 1)
             batch_rays = rays_rgb_holdout[:2]
 
+            print(f'Memory Allocated: {torch.cuda.memory_allocated()/(1024 ** 3):.2f} GB') # added
             print('before evaluation:', i_train, i_holdout)
             # capture new rays
             hold_out_index = choose_new_k(H//args.ds_rate, W//args.ds_rate, focal, batch_rays, args.choose_k, **render_kwargs_test)
@@ -748,12 +766,19 @@ def train():
             rays_rgb_train = torch.reshape(rays_rgb_train, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
 
             print('shuffle rays')
-            np.random.shuffle(rays_rgb_train)
+            # np.random.shuffle(rays_rgb_train)
+            rays_rgb_train = rays_rgb_train[torch.randperm(rays_rgb_train.size(0))] # added
 
             f = os.path.join(basedir, expname, 'args.txt')
             with open(f, 'a') as file:
                 file.write(str(i_train))
                 file.write(str(i_holdout))
+            
+            torch.cuda.empty_cache() # added
+            
+            elapsed_time = time.time() - active_time # added
+            print(f"Active learning step {active_step} completed in {elapsed_time:.2f} seconds.") # added
+            active_step += 1 # added
 
         time0 = time.time()
 
@@ -790,6 +815,8 @@ def train():
 
         loss.backward()
         optimizer.step()
+        
+        torch.cuda.empty_cache() # added
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -882,8 +909,40 @@ def train():
 
         global_step += 1
 
+# added
+def train_all_scenes():
+    blender_scenes = ['chair', 'drums', 'ficus', 'hotdog', 'lego', 'materials', 'mic', 'ship']
+    
+    # llff_scenes = ['fern', 'flower','fortress', 'horns', 'leaves', 'orchids', 'room', 'trex']
+    # llff_scenes = ['flower','fortress', 'horns', 'leaves', 'orchids', 'room', 'trex', 'fern']
+    llff_scenes = ['leaves', 'orchids', 'room', 'trex', 'fern', 'flower','fortress', 'horns']
+
+    # Train on LLFF dataset
+    for scene in llff_scenes:
+        print(f"Training on LLFF scene: {scene}")
+        args.datadir = f'./data/nerf_llff_data/{scene}'
+        args.dataset_type = 'llff'
+        args.expname = f'llff_{scene}'
+        train() 
+
+        torch.cuda.empty_cache()
+        
+    # Train on Blender dataset
+    for scene in blender_scenes:
+        print(f"Training on Blender scene: {scene}")
+        args.datadir = f'./data/nerf_synthetic/{scene}'
+        args.dataset_type = 'blender'
+        args.expname = f'blender_{scene}'
+        train() 
+
+        torch.cuda.empty_cache()
+
 if __name__=='__main__':
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    if torch.cuda.is_available():
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    else:
+        torch.set_default_tensor_type('torch.FloatTensor')
+
     parser = config_parser()
     args = parser.parse_args()
-    train()
+    train_all_scenes() # added
